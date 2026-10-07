@@ -20,9 +20,10 @@ import json
 import math
 import time
 import urllib.request
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime, timedelta, timezone, tzinfo
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo
 
 CACHE_TTL_S = 3600  # phase moves slowly; 1h is plenty
 HTTP_TIMEOUT_S = 12
@@ -76,12 +77,14 @@ def _next_phase(now: datetime, target_fraction: float) -> datetime:
     return now + timedelta(days=delta * _SYNODIC_DAYS)
 
 
-def _fetch_sky(lat: float, lon: float) -> tuple[str | None, str | None, str | None, str | None]:
-    """Return (sunrise_iso, sunset_iso, moonrise_iso, moonset_iso) for
-    today, or all-None on failure. Open-Meteo's daily endpoint serves
-    these without auth."""
+def _fetch_sky(lat: float, lon: float) -> tuple[Any, ...]:
+    """Return (sunrise_iso, sunset_iso, moonrise_iso, moonset_iso,
+    tz_name, utc_offset_seconds) for today at the location, or all-None
+    on failure. Open-Meteo's daily endpoint serves these without auth;
+    with ``timezone=auto`` the times are the location's wall clock and
+    the payload names that zone."""
     if lat == 0 and lon == 0:
-        return None, None, None, None
+        return None, None, None, None, None, None
     url = (
         "https://api.open-meteo.com/v1/forecast"
         f"?latitude={lat}&longitude={lon}"
@@ -92,13 +95,55 @@ def _fetch_sky(lat: float, lon: float) -> tuple[str | None, str | None, str | No
         with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT_S) as resp:
             payload = json.loads(resp.read().decode("utf-8"))
     except Exception:
-        return None, None, None, None
+        return None, None, None, None, None, None
     daily = payload.get("daily") or {}
     sunrise = (daily.get("sunrise") or [None])[0]
     sunset = (daily.get("sunset") or [None])[0]
     moonrise = (daily.get("moonrise") or [None])[0]
     moonset = (daily.get("moonset") or [None])[0]
-    return sunrise, sunset, moonrise, moonset
+    tz_name = payload.get("timezone")
+    offset = payload.get("utc_offset_seconds")
+    return (
+        sunrise,
+        sunset,
+        moonrise,
+        moonset,
+        tz_name if isinstance(tz_name, str) else None,
+        int(offset) if isinstance(offset, (int, float)) and not isinstance(offset, bool) else None,
+    )
+
+
+def _tz_from_name(name: Any) -> tzinfo | None:
+    if not isinstance(name, str) or not name.strip():
+        return None
+    try:
+        return ZoneInfo(name.strip())
+    except (ValueError, KeyError, OSError):
+        return None
+
+
+def _option_tz_name(options: dict[str, Any]) -> str | None:
+    """IANA name carried on a saved location option, if any. Newer
+    servers add ``timezone`` to the picker's location dict; older saved
+    locations and pasted coordinates don't have one."""
+    for value in (options.get("timezone"), options.get("location")):
+        if isinstance(value, dict):
+            value = value.get("timezone")
+        if _tz_from_name(value) is not None:
+            return str(value).strip()
+    return None
+
+
+def _resolve_tz(tz_name: Any, offset_s: Any) -> tzinfo | None:
+    """Location zone from an IANA name, else a fixed UTC offset in
+    seconds. ``None`` means the server's local zone."""
+    tz = _tz_from_name(tz_name)
+    if tz is not None:
+        return tz
+    if isinstance(offset_s, (int, float)) and not isinstance(offset_s, bool):
+        with contextlib.suppress(ValueError, OverflowError):
+            return timezone(timedelta(seconds=int(offset_s)))
+    return None
 
 
 def fetch(
@@ -115,11 +160,15 @@ def fetch(
     if cache.exists() and time.time() - cache.stat().st_mtime < CACHE_TTL_S:
         try:
             cached = json.loads(cache.read_text(encoding="utf-8"))
-            # The "nowMin" inside the sun block is wall-clock dependent,
-            # so always re-stamp it on a cache hit; everything else
+            # "nowMin" and "time" are wall-clock dependent (in the
+            # location's zone), so always re-stamp them on a cache hit; everything else
             # (phase, rise/set, etc.) is stable within the TTL.
+            loc_tz = _resolve_tz(cached.get("tz"), cached.get("utcOffsetSec"))
+            now_min = _now_min(loc_tz)
+            cached["nowMin"] = now_min
+            cached["time"] = _now_hhmm(loc_tz)
             if isinstance(cached.get("sun"), dict):
-                cached["sun"]["nowMin"] = _now_min()
+                cached["sun"]["nowMin"] = now_min
             # ``label`` and the duplicate ``place`` are UI strings from
             # the cell editor, not part of the upstream API response.
             # Overlay both on cache hit so a rename on the same
@@ -138,11 +187,16 @@ def fetch(
     waxing = age < _SYNODIC_DAYS / 2
     name = _phase_name(age)
 
-    sunrise, sunset, moonrise, moonset = _fetch_sky(lat, lon)
+    sunrise, sunset, moonrise, moonset, tz_name, offset_s = _fetch_sky(lat, lon)
+    # Wall-clock fields follow the location, not the server: Open-Meteo's
+    # zone first, then one saved on the location option, else server local.
+    if _tz_from_name(tz_name) is None:
+        tz_name = _option_tz_name(options)
+    loc_tz = _resolve_tz(tz_name, offset_s)
 
     rise_min = _iso_to_min(sunrise)
     set_min = _iso_to_min(sunset)
-    now_min = _now_min()
+    now_min = _now_min(loc_tz)
     day_length = _hhmm_delta(rise_min, set_min)
     solar_noon = _hhmm_mid(rise_min, set_min)
 
@@ -157,7 +211,8 @@ def fetch(
         ("Last Quarter", _next_phase(now, 0.75)),
     ]
     next_label, next_dt = min(upcoming, key=lambda pair: pair[1])
-    next_iso = next_dt.isoformat()  # consumed by ``moon.next`` below
+    # Shown as a calendar date, so read it in the location's zone.
+    next_iso = next_dt.astimezone(loc_tz).isoformat()  # consumed by ``moon.next`` below
 
     result: dict[str, Any] = {
         # Legacy fields the existing client.js render path still uses.
@@ -177,9 +232,14 @@ def fetch(
         "moonrise": moonrise,
         "moonset": moonset,
         "fetched_at": int(time.time()),
+        # Location zone for the client's date labels and for re-stamping
+        # the wall-clock fields on a cache hit. ``tz`` is an IANA name or
+        # None; ``utcOffsetSec`` is the fixed offset when only that is known.
+        "tz": tz_name if _tz_from_name(tz_name) is not None else None,
+        "utcOffsetSec": offset_s,
         # Structured "SUNMOON" block the new variants paint from.
         "place": label,
-        "time": _now_hhmm(),
+        "time": _now_hhmm(loc_tz),
         "rise": _hhmm(sunrise),
         "set": _hhmm(sunset),
         "riseMin": rise_min,
@@ -243,15 +303,15 @@ def _hhmm(iso: Any) -> str:
         return ""
 
 
-def _now_min() -> int:
-    """Wall-clock minutes-since-midnight."""
-    n = datetime.now()
+def _now_min(tz: tzinfo | None = None) -> int:
+    """Wall-clock minutes-since-midnight in ``tz`` (server local if None)."""
+    n = datetime.now(tz)
     return n.hour * 60 + n.minute
 
 
-def _now_hhmm() -> str:
-    """Wall-clock HH:MM for the SUNMOON ``time`` field."""
-    n = datetime.now()
+def _now_hhmm(tz: tzinfo | None = None) -> str:
+    """Wall-clock HH:MM in ``tz`` for the SUNMOON ``time`` field."""
+    n = datetime.now(tz)
     return f"{n.hour:02d}:{n.minute:02d}"
 
 

@@ -107,13 +107,39 @@ function fmtCountdown(deltaMs) {
   return `${minutes}m`;
 }
 
-function fmtDate(iso) {
+// Calendar date of ``d`` as {y, m (0-11), day, wd (0=Sun)} on the
+// location's wall clock. ``tz`` is the IANA zone the server reports for
+// the location; ``offsetSec`` a fixed UTC offset when only that is
+// known. Falls back to the browser's local zone when neither works.
+function zonedParts(d, tz, locale, offsetSec) {
+  if (typeof tz === "string" && tz) {
+    try {
+      const parts = new Intl.DateTimeFormat(locale, {
+        timeZone: tz, year: "numeric", month: "numeric", day: "numeric",
+        hourCycle: "h23", numberingSystem: "latn",
+      }).formatToParts(d);
+      const get = (t) => Number(parts.find((p) => p.type === t)?.value);
+      const y = get("year"), m = get("month"), day = get("day");
+      if ([y, m, day].every(Number.isFinite)) {
+        return { y, m: m - 1, day, wd: new Date(Date.UTC(y, m - 1, day)).getUTCDay() };
+      }
+    } catch { /* unknown zone: fall through */ }
+  }
+  if (Number.isFinite(offsetSec)) {
+    const s = new Date(d.getTime() + offsetSec * 1000);
+    return { y: s.getUTCFullYear(), m: s.getUTCMonth(), day: s.getUTCDate(), wd: s.getUTCDay() };
+  }
+  return { y: d.getFullYear(), m: d.getMonth(), day: d.getDate(), wd: d.getDay() };
+}
+
+function fmtDate(iso, tz, locale, offsetSec) {
   if (typeof iso !== "string") return "";
   const d = new Date(iso);
   if (!Number.isFinite(d.getTime())) return "";
   const days = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
   const months = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
-  return `${days[d.getDay()]} ${d.getDate()} ${months[d.getMonth()]}`;
+  const p = zonedParts(d, tz, locale, offsetSec);
+  return `${days[p.wd]} ${p.day} ${months[p.m]}`;
 }
 
 export default function render(shadow, ctx) {
@@ -158,7 +184,7 @@ export default function render(shadow, ctx) {
           ${escapeHtml(next.label)}
         </span>
         <small class="moon-next-when">
-          <span class="moon-next-date">${escapeHtml(fmtDate(next.iso))}</span>
+          <span class="moon-next-date">${escapeHtml(fmtDate(next.iso, data.tz, ctx?.locale || "en", data.utcOffsetSec))}</span>
           <span class="moon-next-count">${escapeHtml(fmtCountdown(next.delta))}</span>
         </small>
       </div>`
